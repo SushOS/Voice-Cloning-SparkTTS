@@ -4,6 +4,7 @@ import logging
 import sys
 import os
 import time
+import subprocess
 
 # Append the project root to sys.path so that the cli module can be found.
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,25 @@ from cli.SparkTTS import SparkTTS
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def convert_to_wav(input_file, output_file=None):
+    """Convert audio/video file to WAV format."""
+    if output_file is None:
+        output_file = os.path.splitext(input_file)[0] + ".wav"
+    
+    try:
+        subprocess.run([
+            'ffmpeg', '-i', input_file, 
+            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            output_file
+        ], check=True)
+        return output_file
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg conversion failed: {e}")
+        sys.exit(1)
+    except FileNotFoundError:
+        logger.error("FFmpeg not found. Please install FFmpeg.")
+        sys.exit(1)
 
 def generate_speech_with_voice_cloning(
     text_response, # The text to convert to speech.
@@ -94,14 +114,22 @@ def generate_speech_with_voice_cloning(
     return output_path
 
 def main():
-    # Define a sample text response for TTS.
-    sample_text = "My name is Sushant."
-    # Optionally, you can provide a transcript of the prompt audio.
-    prompt_text = "Hello world, this is a sample text to speech test using Spark TTS."
-    # Set the path to your prompt audio file.
-    prompt_audio_path = os.path.join(current_dir, "/prompt_audios/prompt_audio1.wav")
-    # Set the output path for the generated audio.
-    output_file = os.path.join(current_dir, "/output_audios/output_cloned_" + str(time.time()) + ".wav")
+    sample_text = "Hello Satish Sanpal, I see you have an eye for luxury. Your dream property awaits!"
+    prompt_text = "Hello fans of the game, this is Chiteshwar Pujara here. I welcome you to Dafa news."
+    
+    # Original video file
+    original_file = os.path.join(current_dir, "prompt_audios", "pujara_trimmed.mov")
+    # Convert to WAV if not already a WAV file
+    if not original_file.lower().endswith('.wav'):
+        wav_file = os.path.splitext(original_file)[0] + ".wav"
+        prompt_audio_path = convert_to_wav(original_file, wav_file)
+    else:
+        prompt_audio_path = original_file
+    
+    # Fix output path
+    output_dir = os.path.join(current_dir, "output_audios")
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"output_cloned_{int(time.time())}.wav")
     
     generate_speech_with_voice_cloning(
         text_response=sample_text,
@@ -109,6 +137,5 @@ def main():
         prompt_text=prompt_text,
         output_path=output_file
     )
-
 if __name__ == "__main__":
     main()
