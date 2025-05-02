@@ -29,6 +29,51 @@ from pathlib import Path
 from typing import Tuple
 from numpy.lib.stride_tricks import sliding_window_view
 
+# Add to the top of sparktts/utils/audio.py
+import subprocess
+import os
+import tempfile
+import logging
+
+logger = logging.getLogger(__name__)
+
+def convert_to_wav(input_file, output_file=None, sample_rate=16000):
+    """Convert audio/video file to WAV format using FFmpeg.
+    
+    Args:
+        input_file (str): Path to input audio/video file
+        output_file (str, optional): Path for output WAV file. If None, creates a temporary file.
+        sample_rate (int): Target sample rate for the audio
+        
+    Returns:
+        str: Path to the converted WAV file
+    """
+    if output_file is None:
+        # Create a temporary file with .wav extension
+        fd, output_file = tempfile.mkstemp(suffix='.wav')
+        os.close(fd)
+    
+    try:
+        subprocess.run([
+            'ffmpeg', '-i', input_file, 
+            '-acodec', 'pcm_s16le',  # 16-bit PCM
+            '-ar', str(sample_rate),  # Target sample rate
+            '-ac', '1',               # Mono
+            '-y',                     # Overwrite output file
+            output_file
+        ], check=True, capture_output=True)
+        
+        # Verify the file exists and has content
+        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+            raise IOError(f"FFmpeg failed to create a valid WAV file at {output_file}")
+            
+        return output_file
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg conversion failed: {e.stderr.decode() if e.stderr else str(e)}")
+        raise
+    except FileNotFoundError:
+        logger.error("FFmpeg not found. Please install FFmpeg on your system.")
+        raise
 
 def audio_volume_normalize(audio: np.ndarray, coeff: float = 0.2) -> np.ndarray:
     """
@@ -79,44 +124,124 @@ def load_audio(
     length: int = None,
     volume_normalize: bool = False,
     segment_duration: int = None,
+    min_length: int = 160  # Minimum audio length (10ms at 16kHz)
 ) -> np.ndarray:
-    r"""Load audio file with target sampling rate and lsength
-
+    """Load audio file with target sampling rate and length.
+    Supports automatic conversion of non-WAV formats using FFmpeg.
+    
     Args:
-        adfile (Path): path to audio file.
-        sampling_rate (int, optional): target sampling rate. Defaults to None.
-        length (int, optional): target audio length. Defaults to None.
-        volume_normalize (bool, optional): whether perform volume normalization. Defaults to False.
-        segment_duration (int): random select a segment with duration of {segment_duration}s.
-                                Defualt to None which means the whole audio will be used.
-
+        adfile (Path): Path to audio file.
+        sampling_rate (int, optional): Target sampling rate. Defaults to None.
+        length (int, optional): Target audio length. Defaults to None.
+        volume_normalize (bool, optional): Whether to perform volume normalization. Defaults to False.
+        segment_duration (int): Random select a segment with duration. Defaults to None.
+        min_length (int): Minimum audio length (in samples) to prevent zero-size inputs
+        
     Returns:
-        audio (np.ndarray): audio
+        audio (np.ndarray): Audio array
     """
+    # Check if file is WAV, if not, convert it
+    adfile_str = str(adfile)
+    temp_file = None
+    
+    if not adfile_str.lower().endswith('.wav'):
+        try:
+            temp_file = convert_to_wav(adfile_str, sample_rate=sampling_rate or 16000)
+            adfile_str = temp_file
+        except Exception as e:
+            logger.error(f"Error converting audio: {e}")
+            raise
+    
+    try:
+        audio, sr = soundfile.read(adfile_str)
+        if len(audio.shape) > 1:
+            audio = audio[:, 0]  # Convert stereo to mono by taking first channel
 
-    audio, sr = soundfile.read(adfile)
-    if len(audio.shape) > 1:
-        audio = audio[:, 0]
+        if sampling_rate is not None and sr != sampling_rate:
+            audio = soxr.resample(audio, sr, sampling_rate, quality="VHQ")
+            sr = sampling_rate
 
-    if sampling_rate is not None and sr != sampling_rate:
-        audio = soxr.resample(audio, sr, sampling_rate, quality="VHQ")
-        sr = sampling_rate
+        if segment_duration is not None:
+            seg_length = int(sr * segment_duration)
+            audio = random_select_audio_segment(audio, seg_length)
 
-    if segment_duration is not None:
-        seg_length = int(sr * segment_duration)
-        audio = random_select_audio_segment(audio, seg_length)
+        # Audio volume normalize
+        if volume_normalize:
+            audio = audio_volume_normalize(audio)
+        
+        # Ensure minimum audio length to prevent zero-size errors in models
+        if len(audio) < min_length:
+            audio = np.pad(audio, (0, min_length - len(audio)))
+        
+        # Check the audio length
+        if length is not None:
+            assert abs(audio.shape[0] - length) < 1000
+            if audio.shape[0] > length:
+                audio = audio[:length]
+            else:
+                audio = np.pad(audio, (0, int(length - audio.shape[0])))
+                
+        # Detect and handle if audio is completely silent
+        if np.all(np.abs(audio) < 1e-6):
+            logger.warning("Audio contains only silence, adding small noise")
+            audio = audio + np.random.normal(0, 1e-6, audio.shape)
+            
+        return audio
+    
+    finally:
+        # Clean up temporary file if created
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
-    # Audio volume normalize
-    if volume_normalize:
-        audio = audio_volume_normalize(audio)
-    # check the audio length
-    if length is not None:
-        assert abs(audio.shape[0] - length) < 1000
-        if audio.shape[0] > length:
-            audio = audio[:length]
-        else:
-            audio = np.pad(audio, (0, int(length - audio.shape[0])))
-    return audio
+
+
+# def load_audio(
+#     adfile: Path,
+#     sampling_rate: int = None,
+#     length: int = None,
+#     volume_normalize: bool = False,
+#     segment_duration: int = None,
+# ) -> np.ndarray:
+#     r"""Load audio file with target sampling rate and lsength
+
+#     Args:
+#         adfile (Path): path to audio file.
+#         sampling_rate (int, optional): target sampling rate. Defaults to None.
+#         length (int, optional): target audio length. Defaults to None.
+#         volume_normalize (bool, optional): whether perform volume normalization. Defaults to False.
+#         segment_duration (int): random select a segment with duration of {segment_duration}s.
+#                                 Defualt to None which means the whole audio will be used.
+
+#     Returns:
+#         audio (np.ndarray): audio
+#     """
+
+#     audio, sr = soundfile.read(adfile)
+#     if len(audio.shape) > 1:
+#         audio = audio[:, 0]
+
+#     if sampling_rate is not None and sr != sampling_rate:
+#         audio = soxr.resample(audio, sr, sampling_rate, quality="VHQ")
+#         sr = sampling_rate
+
+#     if segment_duration is not None:
+#         seg_length = int(sr * segment_duration)
+#         audio = random_select_audio_segment(audio, seg_length)
+
+#     # Audio volume normalize
+#     if volume_normalize:
+#         audio = audio_volume_normalize(audio)
+#     # check the audio length
+#     if length is not None:
+#         assert abs(audio.shape[0] - length) < 1000
+#         if audio.shape[0] > length:
+#             audio = audio[:length]
+#         else:
+#             audio = np.pad(audio, (0, int(length - audio.shape[0])))
+#     return audio
 
 
 def random_select_audio_segment(audio: np.ndarray, length: int) -> np.ndarray:
